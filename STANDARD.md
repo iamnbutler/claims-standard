@@ -70,9 +70,19 @@ Each kind of evidence rules out different things, and a claim keeps all of them.
 
 ### 3.1 Scopes
 
-A scope MUST match `[a-z][a-z0-9_]*` and SHOULD equal the package's registry name. A package has
-exactly one scope. Implementations MUST refuse to build when the scope declared for claims
-differs from the package's name in its manifest.
+A scope is the package's name, written the way its ecosystem writes it: `my-app`, `my_app`,
+`My.App` and `@org/app` are all valid scopes. The standard doesn't pick a naming convention,
+because ecosystems disagree: some refuse `_`, and others refuse `-`.
+
+- A scope MUST be non-empty and MUST NOT contain `^`, `#`, whitespace or control characters,
+  because those delimit refs (§3.3) and ledger fields (§6.1).
+- Two scopes are the **same scope** when their normalized forms are equal. To normalize a scope,
+  lowercase it, then replace every run of `-`, `_` and `.` with a single `-`. Under this rule
+  `My_App`, `my-app` and `my.app` are the same scope. Implementations MUST compare scopes by
+  their normalized form. They MUST write a scope as it was declared, and never as its normalized
+  form.
+- A package has exactly one scope. Implementations MUST refuse to build when the scope declared
+  for claims isn't the same scope as the package's name in its manifest.
 
 Implementations MUST NOT supply a default scope that another package could also get by default.
 One safe choice is to default to the implementation's own scope. A package that forgot to set its
