@@ -182,22 +182,142 @@ export MUST NOT claim a flow step uses one it can't deliver.
 
 ### 4.2 flow
 
-A flow is a path a person can take through the application to reach a goal.
+A flow is a way a person gets something done: several claims in an order, toward an outcome.
+"Sign in", "check out" and "start over" are flows. A flow can branch where the application or
+the world decides what happens next. Signing in can end with a session, a code request, a wrong
+password or no network.
 
 | Part | Required | Meaning |
 |---|---|---|
-| `does`, `sees` | yes | the path and its outcome, in the person's terms |
+| `does`, `sees` | yes | the journey and its outcomes, in the person's terms |
 | `machine` | yes | the machine the flow is about |
-| `goal` | yes | a predicate over state |
-| `witness` | yes | a finite list of actions, each a trigger, a ref in this scope (keyed if needed) and its argument |
+| `from` | no | where the flow starts: a predicate over state, together with one concrete state that satisfies it. The default is the machine's initial state. |
+| `steps` | yes | what happens, in order (§4.2.1) |
+| `ends` | yes | one or more named outcomes, each a predicate over state. A flow with one outcome MAY call its only end `goal`. |
 
-A flow holds when two things are true:
-- **live**: replaying the witness from the machine's initial state, every step is answered by an
-  enabled handler of the move it names. No step is a no-op.
-- **reaches**: the state after the last step satisfies `goal`.
+#### 4.2.1 Steps
 
-Both are decidable by running the witness. A flow is therefore checkable at every level, and at
-the Checked level it MUST be checked on every build (§10.2).
+| Step | Meaning |
+|---|---|
+| `<trigger> ^N[#K] [arg]` | the person acts on a move in this scope, with a concrete argument if the trigger takes one (`edit ^31 insert("a@b.co")`, `press ^33`) |
+| `receive <message>` | the world answers with a concrete message (§7.2), such as a reply to a request or a timer firing. An implementation SHOULD check that the message answers an effect still outstanding at that point. |
+| `flow ^M` | include flow M from this scope: its steps run here, and the outer flow continues once M has reached one of its ends. An implementation MAY restrict which of M's ends allow it to continue (`flow ^M until signedIn`). |
+| `branch { name: steps, … }` | alternatives. Each one is a named list of steps, and each MUST finish with `end <name>` or `continue`. `continue` rejoins the steps after the branch. |
+| `repeat ≤ n { steps }` | the steps run 0 to n times, so that "try again" is expressible. n MUST be a literal. |
+| `end <name>` | the path stops here, at one of the flow's `ends` |
+
+A list of steps that reaches its last step without an `end` finishes at `goal`, so a straight
+flow needs no `end`. Includes MUST NOT be recursive, directly or indirectly.
+
+#### 4.2.2 Paths
+
+A flow denotes a finite set of **paths**. To get them, expand the flow:
+- replace each include with the included flow's steps;
+- take each alternative of each branch;
+- take every count from 0 to n of each repeat.
+
+Each path is a start state, a list of concrete actions and messages, and the end it finishes at.
+Branches and bounded repeats keep the set finite. Implementations MAY cap how many paths a flow
+expands to, and MUST report a flow over the cap rather than skip it.
+
+Each path is named by its route, for example `signIn/twoFactor` or `retry×2/ok`. The names appear
+in evidence (§8) and in the export.
+
+A flow holds when every path is:
+- **live**: replaying the path from its start state, every action step is answered by an enabled
+  handler of the move it names (no step is a no-op), and every message step is accepted by
+  `receive`;
+- **reaches**: the state at the path's end satisfies that end's predicate.
+
+Both are decidable by running the paths. A flow is therefore checkable at every level, and at the
+Checked level every path MUST be checked on every build (§10.2).
+
+#### 4.2.3 Exhaustive branches
+
+Running the paths shows that each listed alternative works. It doesn't show that the list is
+complete. Is there a fifth answer the server can give that the flow forgot? A branch MAY say
+that its list is complete:
+
+```
+branch exhaustive on <what> { name: steps, … }
+```
+
+`<what>` is the point where the outcome is decided. It is either the next message, or the state
+after the previous step. Each alternative then gives a **guard**, which is a predicate over that
+message, or over that state:
+
+```
+branch exhaustive on message {
+  ok        when m is Reply.ok:          receive Reply.ok("t0k3n"), end signedIn
+  ...
+}
+```
+
+The branch is **exhaustive** when the guards cover every case. For a message, that means every
+message `receive` accepts at that point. For a state, it means every state that satisfies the
+flow's `from` and that the steps before the branch can lead to, under the arguments given. Each
+guard's concrete step MUST satisfy its own guard.
+
+Exhaustiveness is a claim about all cases, so how it is checked depends on the level:
+- at **Checked**, by fuzzing: random messages, or random start states, that satisfy no guard are
+  a failure;
+- at **Proved**, by a theorem: the disjunction of the guards holds.
+
+When a message type is a closed sum, an implementation SHOULD check message exhaustiveness
+statically: one alternative per variant, with nothing left over. That is exhaustive matching, as
+in Rust's `match` or TypeScript's `never` check.
+
+#### 4.2.4 Example: signing in
+
+```
+place ^30 signInSheet "Sign-in sheet"
+move  ^31 email    "Email"     in ^30   on edit, submit
+move  ^32 password "Password"  in ^30   on edit, submit
+move  ^33 signIn   "Sign in"   in ^30   on press        -- emits request(auth, email, password)
+move  ^35 code     "Code"      in ^30   on edit
+move  ^36 verify   "Verify"    in ^30   on press        -- emits request(verify, code)
+
+flow ^40 signIn "Sign in" for app where
+  does "Enter your email and password, then press Sign in."
+  sees "You're signed in, or told why not and can try again."
+  from s := s.session = none                     -- start: signedOut
+  steps
+    edit ^31 insert("ada@example.com")
+    edit ^32 insert("correct horse")
+    press ^33
+    branch exhaustive on message {
+      ok        when m is Reply.ok:          receive Reply.ok("t0k3n"), end signedIn
+      twoFactor when m is Reply.needsCode:   receive Reply.needsCode,
+                                             edit ^35 insert("123456"), press ^36,
+                                             receive Reply.ok("t0k3n"), end signedIn
+      wrong     when m is Reply.badPassword: receive Reply.badPassword, end refused
+      offline   when m is Lost:              receive Lost, end offline
+    }
+  ends
+    signedIn s := s.session ≠ none
+    refused  s := s.session = none ∧ s.error = some .badPassword ∧ enabled ^33 s
+    offline  s := s.session = none ∧ s.error = some .offline ∧ enabled ^33 s
+```
+
+This flow has four paths:
+- `signIn/ok` and `signIn/twoFactor` end at `signedIn`;
+- `signIn/wrong` ends at `refused`;
+- `signIn/offline` ends at `offline`.
+
+Each path is checked by running it. The `exhaustive` branch adds a check that the auth reply has
+no fifth case. If someone later adds `Reply.locked` to the server's replies, the flow breaks until
+it handles that case. `refused` and `offline` also say that Sign in is enabled again, so the
+person can retry. A `checkout` flow can then begin with `flow ^40 until signedIn`.
+
+#### 4.2.5 What a flow does not claim
+
+- **Paths, not all arguments.** Each path uses the concrete arguments written in it. "Sign-in
+  works for every valid password" is a claim about all inputs. It belongs in a move's `post`, or
+  in an invariant, where it can be fuzzed or proved.
+- **No unbounded loops.** `repeat` is bounded. "The person can retry forever" is an invariant:
+  after `refused`, Sign in is enabled.
+- **No timing.** A step happens when the previous one is done. Timeouts reach the application as
+  messages (`receive Timer.fired("auth")`), and flows treat them like any other message.
 
 ### 4.3 invariant
 
@@ -261,8 +381,10 @@ An implementation MUST refuse to build a package, naming the claim, when any of 
 3. Every `in ^P` names a live place in the scope.
 4. Every move has at least one handler, at most one per trigger, and each handler has `apply`
    and `post`.
-5. Every flow's witness names existing moves in the scope, each with a handler for that step's
-   trigger. A keyed move's step carries a key, and an `edit` step carries an operation.
+5. Every flow step names an existing move in the scope that has a handler for the step's
+   trigger. A keyed move's step carries a key, and an `edit` step carries an operation. Every
+   `end` names one of the flow's ends. Includes name flows in the scope and aren't recursive.
+   Every `repeat` has a literal bound.
 6. Every tombstone has a reason.
 7. **No behaviour without a claim**: the application's update function is assembled from its
    moves and nothing else (§7.1). If the implementation can't enforce this structurally, it MUST
@@ -343,7 +465,7 @@ wrong number of fields, an unknown kind or an unknown status.
 The fingerprint is a 64-bit hash of the claim's **meaning-bearing definitions**:
 - its kind;
 - for a move: whether it is keyed, its triggers, `enabled`, and every handler's `post`;
-- for a flow: `goal` and `witness`;
+- for a flow: `from`, `steps` (with each branch's guards) and `ends`;
 - for an invariant: `holds`;
 - for an assumption: `statement`.
 
@@ -473,7 +595,7 @@ What each kind means for each claim:
 | Claim | proved | fuzzed | tested | seen | assumed |
 |---|---|---|---|---|---|
 | move | each handler's `sound` | random action sequences; after each step, `post` held and the control was present iff enabled | the running app matched the model at every step that exercised the move | its control appears in a captured frame | |
-| flow | `live` and `reaches` | (not applicable: a flow is a fixed path) | the witness replayed on the running app reached the goal | the witness replayed, each step on the control it names | |
+| flow | each path's `live` and `reaches`; each exhaustive branch's coverage | each exhaustive branch: random messages or states all matched a guard | every path replayed on the running app reached its end | every path replayed, each step on the control it names | |
 | invariant | `init`, `step`, `receive` | `holds` after every step of random sequences | `holds` on the running app's model state at every step | (not applicable) | |
 | assume | (never) | its `check` held in every case run | | | always |
 | place | | | | its region appears in a captured frame | |
@@ -534,7 +656,8 @@ The export is a package's claims as JSON, produced from the build, never written
       "place": 3, "retired": null,
       "statement": "5ace86b109a74bf5",
       "triggers": ["press"], "keyed": false,
-      "witness": null, "passes": [], "machine": null, "check": null,
+      "steps": null, "ends": [], "paths": [], "witness": null, "passes": [],
+      "machine": null, "check": null,
       "pos": { "file": "src/counter.rs", "line": 59 },
       "decl": "counter::reset",
       "evidence": [
@@ -557,8 +680,11 @@ The export is a package's claims as JSON, produced from the build, never written
 | `claims[].statement` | string or null | the fingerprint, as in the ledger |
 | `claims[].triggers` | string[] | moves |
 | `claims[].keyed` | boolean | moves |
-| `claims[].witness` | step[] or null | flows: `{ "trigger", "ref", "claim", "key", "op"? }` |
-| `claims[].passes` | integer[] | flows: the move ids the witness passes through, in order |
+| `claims[].steps` | step[] or null | flows: the step tree as written (§4.2.1). Each step is one of `{ "trigger", "ref", "claim", "key"?, "op"? }`, `{ "receive": <message> }`, `{ "flow": M, "until"? }`, `{ "branch": [{ "name", "guard"?, "steps" }], "exhaustive": bool, "on"? }`, `{ "repeat": n, "steps" }`, `{ "end": name }` or `{ "continue": true }`. Messages are JSON values in a form the implementation documents. |
+| `claims[].ends` | string[] | flows: the names of its ends |
+| `claims[].paths` | object[] | flows: the expanded paths, `{ "name", "end", "steps" }`, with only action and message steps. Tools that replay flows read these. |
+| `claims[].passes` | integer[] | flows: every move id any path passes through, in first-seen order |
+| `claims[].witness` | step[] or null | flows with exactly one path and no messages: that path's steps. Kept for readers of straight flows. |
 | `claims[].machine` | string or null | flows and invariants: the machine's declaration |
 | `claims[].check` | string or null | assumptions: the check's name |
 | `claims[].pos` | `{file, line}` | where it's declared, relative to the package root |
@@ -605,9 +731,10 @@ Everything in Claims-Ledger, plus:
   state and the action.
 - **Invariants checked at runtime.** In development and test builds, `holds` is evaluated after
   every action and message.
-- **Flows replayed on every build.** Each flow's witness is run against the machine. `live` and
-  `reaches` must both hold, or the build fails. This costs one run per flow and is exactly as
-  strong as a proof for that one path.
+- **Flows replayed on every build.** Every path of every flow is run against the machine. `live`
+  and `reaches` must both hold, or the build fails. Exhaustive branches are fuzzed (§4.2.3). This
+  costs one run per path and is exactly as
+  strong as a proof for each path.
 - **Refs in the UI** (§7.3).
 - **A fuzzer**: random sequences of enabled actions (and messages, if the machine receives any)
   from the initial state, checking every `post`, every invariant, and that each move's control is
@@ -626,7 +753,8 @@ Prusti or Kani for Rust, and Liquid Haskell.
 
 Everything in Claims-Checked, plus:
 
-- **Each handler's `sound`**, each flow's `live` and `reaches`, and each invariant's `init`,
+- **Each handler's `sound`**, each flow path's `live` and `reaches`, each exhaustive branch's
+  coverage, and each invariant's `init`,
   `step` and (if the machine receives messages) `receive` is a theorem the checker accepts.
 - **The dispatch guarantees of §7.1 are theorems** about the implementation's dispatch, stated
   once in the framework for every application:
@@ -703,7 +831,7 @@ documentation, and SHOULD make a changed fingerprint visible in review.
 ## 13. Not covered in 0.1
 
 - **Cross-scope refs in formal parts.** A claim can mention another package's claim
-  (`platform^1005`) only in prose. A flow can't step through another package's move.
+  (`platform^1005`) only in prose. A flow can't step through another package's move or include another package's flow.
 - **Effects in `post`.** `post` constrains state. A later version may add an `effects` clause that
   constrains what a handler emits.
 - **Presence and pressability as claims.** "^2's control is on screen iff `enabled`" is checked
