@@ -228,7 +228,7 @@ reports clicks where they happen", "the clock never goes backwards".
 |---|---|---|
 | `does` | yes | the assumption, in words |
 | `statement` | no | a formal statement of it |
-| `check` | no | the name of a runnable check that gathers evidence for it: lowercase letters, digits, `.` and `-` |
+| `check` | no | the name of a runnable check that gathers evidence for it. It MUST NOT contain whitespace, `^` or `#`. |
 
 An assumption is never proved. An implementation at the Proved level MUST NOT make an
 assumption's statement an axiom. A theorem that relies on it takes it as a hypothesis, so every
